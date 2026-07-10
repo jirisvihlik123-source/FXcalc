@@ -435,6 +435,7 @@ USD_CLUSTER_MAP = {
 }
 
 _cache: Dict[Tuple[str, str, int], Tuple[float, pd.DataFrame]] = {}
+_td_req_times: deque[float] = deque(maxlen=20000)
 LAST_SIG_BAR: Dict[Tuple[str, str, str], pd.Timestamp] = {}
 _last_rsi_state: Dict[Tuple[str, str], str] = {}
 _last_price_emit: Dict[Tuple[str, str], float] = {}
@@ -610,6 +611,16 @@ def tf_to_minutes(tf: str) -> int:
         "D1": 1440,
         "D": 1440,
     }.get(tf, 5)
+
+def _record_td_request() -> None:
+    _td_req_times.append(time.time())
+
+def td_usage_summary() -> str:
+    now = time.time()
+    m1 = sum(1 for t in _td_req_times if now - t <= 60)
+    m15 = sum(1 for t in _td_req_times if now - t <= 900)
+    h1 = sum(1 for t in _td_req_times if now - t <= 3600)
+    return f"TD req: 1m={m1} | 15m={m15} | 60m={h1}"
 
 def _today_str() -> str:
     try:
@@ -888,6 +899,7 @@ async def fetch_ohlc(symbol: str, tf: str, limit: int, *, use_cache=True) -> pd.
     r = None
     for attempt in range(3):
         try:
+            _record_td_request()
             r = await HTTP_CLIENT.get(url, params=params, timeout=10.0)
             if r.status_code in retry_http_codes:
                 sleep_s = min(RATE_LIMIT_BACKOFF_SEC, 2 ** attempt)
@@ -1774,6 +1786,56 @@ async def analyze_symbol(
     break_prev_high = bar_close > prev_high
     break_prev_low = bar_close < prev_low
 
+    # Gold ma casto dobry smer, ale pred skutecnym odpalem udela sweep/chop.
+    # Proto XAU nechceme brat jen na "pekne" svicce; cekame na potvrzeny
+    # break male pullback range, nebo na sweep likvidity a reclaim.
+    trigger_window = df_closed.iloc[:-1].tail(4) if len(df_closed) >= 5 else df_closed.tail(4)
+    if trigger_window.empty:
+        trigger_high = prev_high
+        trigger_low = prev_low
+    else:
+        trigger_high = float(trigger_window["high"].max())
+        trigger_low = float(trigger_window["low"].min())
+
+    trigger_buffer = atr * 0.02
+    sweep_buffer = atr * 0.08
+
+    break_pullback_high = bar_close > max(prev_high, trigger_high + trigger_buffer)
+    break_pullback_low = bar_close < min(prev_low, trigger_low - trigger_buffer)
+
+    sweep_reclaim_long = (
+        bar_low <= trigger_low - sweep_buffer
+        and bar_close > prev_high
+        and bar_close >= ema50
+        and close_pos_long >= 0.62
+        and body_ratio >= 0.22
+    )
+
+    sweep_reclaim_short = (
+        bar_high >= trigger_high + sweep_buffer
+        and bar_close < prev_low
+        and bar_close <= ema50
+        and close_pos_short >= 0.62
+        and body_ratio >= 0.22
+    )
+
+    continuation_break_long = (
+        break_prev_high
+        and strong_bull_close
+        and bar_close >= ema50
+        and close_pos_long >= 0.62
+    )
+
+    continuation_break_short = (
+        break_prev_low
+        and strong_bear_close
+        and bar_close <= ema50
+        and close_pos_short >= 0.62
+    )
+
+    gold_confirm_long = break_pullback_high or sweep_reclaim_long or continuation_break_long
+    gold_confirm_short = break_pullback_low or sweep_reclaim_short or continuation_break_short
+
     continuation_ok_long = (
         (bar_close > bar_open)
         and (close_pos_long >= 0.55)
@@ -1833,10 +1895,7 @@ async def analyze_symbol(
         and pullback_long
         and not late_long
         and not_spike
-        and (
-            pa_ok_long
-            or strong_momentum_long
-        )
+        and gold_confirm_long
     )
 
 
@@ -1845,10 +1904,7 @@ async def analyze_symbol(
         and pullback_short
         and not late_short
         and not_spike
-        and (
-            pa_ok_short
-            or strong_momentum_short
-        )
+        and gold_confirm_short
     )
     df_pat = df.iloc[:-1] if len(df) >= 3 else df
     pat = detect_patterns(df_pat)
@@ -1878,6 +1934,7 @@ async def analyze_symbol(
                 "rsi=%.1f lo=%.1f hi=%.1f | "
                 "not_overext=%s ema_dist_atr=%.2f | "
                 "paL=%s paS=%s body=%.2f closeL=%.2f closeS=%.2f breakH=%s breakL=%s | "
+                "goldConfirmL=%s goldConfirmS=%s trigH=%.2f trigL=%.2f sweepL=%s sweepS=%s | "
                 "regime=%s chop=%s rar=%.2f | "
                 "pullbackL=%s pullbackS=%s | "
                 "lateL=%s lateS=%s | "
@@ -1915,6 +1972,12 @@ async def analyze_symbol(
                 close_pos_short,
                 break_prev_high,
                 break_prev_low,
+                gold_confirm_long,
+                gold_confirm_short,
+                trigger_high,
+                trigger_low,
+                sweep_reclaim_long,
+                sweep_reclaim_short,
                 regime,
                 is_chop,
                 rar,
@@ -2037,7 +2100,7 @@ async def analyze_symbol(
     else:
         adx_ok = adx >= max(adx_min_eff, ADX_STRONG - 2.0)
 
-    pa_ok_side = pa_ok_long if side == "long" else pa_ok_short
+    pa_ok_side = gold_confirm_long if side == "long" else gold_confirm_short
     strong_momentum_side = strong_momentum_long if side == "long" else strong_momentum_short
 
     sr_ok_for_alert = ok_sr or (
@@ -2046,8 +2109,13 @@ async def analyze_symbol(
         and adx >= adx_min_eff
     )
 
-    # EMA pullback strategie neobchoduje chop; vysoke ADX ani AI ho neprepisuji.
-    chop_ok_for_alert = not is_chop
+    # EMA pullback strategie nechce mlet chop, ale silny potvrzeny breakout z range
+    # je presne situace, kde XAU casto udela velky odpal.
+    chop_ok_for_alert = (not is_chop) or (
+        side_breakout
+        and pa_ok_side
+        and adx >= ADX_STRONG
+    )
 
     pa_ok_for_alert = pa_ok_side
 
@@ -2093,20 +2161,20 @@ async def analyze_symbol(
         if side == "long":
             momentum_entry = (
                 adx >= MARKET_ENTRY_ADX_MIN
-                and break_prev_high
+                and gold_confirm_long
             )
         else:
             momentum_entry = (
                 adx >= MARKET_ENTRY_ADX_MIN
-                and break_prev_low
+                and gold_confirm_short
             )
 
     entry_mode = "market" if momentum_entry else "limit"
     signal_entry = close if momentum_entry else ema50 + (close - ema50) * 0.25
     structure_stop = (
-        float(recent_gold["low"].min()) - atr * 0.10
+        float(recent_gold["low"].min()) - atr * 0.22
         if side == "long"
-        else float(recent_gold["high"].max()) + atr * 0.10
+        else float(recent_gold["high"].max()) + atr * 0.22
     )
 
     audit = {
@@ -2130,6 +2198,11 @@ async def analyze_symbol(
         "signal_entry": signal_entry,
         "structure_stop": structure_stop,
         "momentum_entry": momentum_entry,
+        "gold_confirm": (gold_confirm_long if side == "long" else gold_confirm_short),
+        "break_pullback_high": break_pullback_high,
+        "break_pullback_low": break_pullback_low,
+        "sweep_reclaim_long": sweep_reclaim_long,
+        "sweep_reclaim_short": sweep_reclaim_short,
         "space_ok_long": space_ok_long,
         "space_ok_short": space_ok_short,
     }
@@ -2210,12 +2283,12 @@ async def analyze_symbol(
 
                     if PAPER_TRADES_ON and created_trade_id is None:
                         log.info(
-                            "ALERT+ paper tracking skipped/blocked; Telegram alert still sent %s %s %s",
+                            "ALERT+ suppressed because paper tracking was not created %s %s %s",
                             symbol,
                             tf,
                             side,
                         )
-                        final_msg += "\n\nTRACKING\n⚠️ Paper tracking not created → no WON/LOSS for this alert."
+                        return None, None
 
                     mark_emitted(symbol, side, SOURCE_ANALYZER)
                     _update_emit_trackers(symbol, side, close, atr)
@@ -2283,12 +2356,12 @@ async def analyze_symbol(
 
                     if PAPER_TRADES_ON and created_trade_id is None:
                         log.info(
-                            "ALERT paper tracking skipped/blocked; Telegram alert still sent %s %s %s",
+                            "ALERT suppressed because paper tracking was not created %s %s %s",
                             symbol,
                             tf,
                             side,
                         )
-                        final_msg += "\n\nTRACKING\n⚠️ Paper tracking not created → no WON/LOSS for this alert."
+                        return None, None
 
                     mark_emitted(symbol, side, SOURCE_ANALYZER)
                     _update_emit_trackers(symbol, side, close, atr)
@@ -2687,6 +2760,8 @@ def trade_engine_fallback(
     if side_up not in ("LONG", "SHORT"):
         side_up = "LONG" if str(side).lower().startswith("l") else "SHORT"
     sym = normalize_symbol(symbol)
+    state_changed = False
+    now_utc = pd.Timestamp.now("UTC")
 
     for tid, existing in list(st.items()):
         try:
@@ -2703,6 +2778,57 @@ def trade_engine_fallback(
                 continue
 
             if ex_sym == sym:
+                opened_raw = str(existing.get("opened_utc", "") or "")
+                try:
+                    opened_ts = pd.Timestamp(opened_raw)
+                    if opened_ts.tzinfo is None:
+                        opened_ts = opened_ts.tz_localize("UTC")
+                    age_min = (now_utc - opened_ts).total_seconds() / 60.0
+                except Exception:
+                    age_min = 999999.0
+
+                stale_limit = (
+                    ENTRY_TIMEOUT_MINUTES + 10.0
+                    if ex_status == "PENDING"
+                    else MAX_TRADE_MINUTES + 30.0
+                )
+                if age_min >= stale_limit:
+                    log.warning(
+                        "STALE PAPER TRADE cleanup %s | existing %s trade_id=%s status=%s/%s age=%.1fm",
+                        sym,
+                        ex_side,
+                        str(existing.get("trade_id") or tid),
+                        ex_status,
+                        ex_signal_state,
+                        age_min,
+                    )
+                    closed_utc = (
+                        dt.datetime.utcnow()
+                        .replace(tzinfo=timezone.utc)
+                        .isoformat()
+                        .replace("+00:00", "Z")
+                    )
+                    try:
+                        master_mark_closed(
+                            str(existing.get("trade_id") or tid),
+                            closed_utc=closed_utc,
+                            status="STALE_CLEARED",
+                            pips=0.0,
+                            pnl_usd=0.0,
+                            r_value=0.0,
+                            rrr=existing.get("rrr", None),
+                            lot_size=float(existing.get("lot_size", 0.0) or 0.0),
+                            gross_pips=0.0,
+                            cost_pips=0.0,
+                            total_cost_pips=0.0,
+                            commission_usd=0.0,
+                        )
+                    except Exception as e:
+                        log.warning("STALE PAPER master close failed %s: %s", tid, e)
+                    st.pop(tid, None)
+                    state_changed = True
+                    continue
+
                 ex_opened = str(existing.get("opened_utc", "") or "")
                 log.info(
                     "SYMBOL BLOCK %s | existing %s trade_id=%s status=%s/%s opened=%s",
@@ -2716,6 +2842,9 @@ def trade_engine_fallback(
                 return None
         except Exception:
             continue
+
+    if state_changed:
+        _save_trades_state(st)
 
     if CORRELATION_GUARD:
         corr_count = _open_corr_cluster_count(st, sym, side_up)
@@ -3404,12 +3533,45 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/risk – stav denního risk limitu\n"
             "/env – runtime konfigurace\n"
             "/health – heartbeat\n"
+            "/usage – TwelveData usage limit\n"
             "/trades today – přehled dnešních uzavřených obchodů\n"
             "/open – aktuálně otevřené obchody\n"
             "/id – vypíše tvoje chat_id\n"
         ),
         html=True,
     )
+
+async def cmd_usage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if HTTP_CLIENT is None:
+        await send_message(ctx, update.effective_chat.id, "TwelveData usage: HTTP client not ready.")
+        return
+    try:
+        r = await HTTP_CLIENT.get(
+            "https://api.twelvedata.com/api_usage",
+            params={"apikey": TWELVE_API_KEY},
+            timeout=10.0,
+        )
+        data = r.json()
+        cur = int(data.get("current_usage", 0) or 0)
+        lim = int(data.get("plan_limit", 0) or 0)
+        left = max(0, lim - cur) if lim else 0
+        pct = (cur / lim * 100.0) if lim else 0.0
+        cat = data.get("plan_category", "unknown")
+        ts = data.get("timestamp", "")
+        await send_message(
+            ctx,
+            update.effective_chat.id,
+            (
+                "📡 TwelveData usage\n"
+                f"Plan: {cat}\n"
+                f"Used: {cur}/{lim} per min ({pct:.1f}%)\n"
+                f"Left: {left} per min\n"
+                f"Bot local: {td_usage_summary()}\n"
+                f"TS: {ts}"
+            ),
+        )
+    except Exception as e:
+        await send_message(ctx, update.effective_chat.id, f"TwelveData usage error: {e}")
 
 async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send_message(ctx, update.effective_chat.id, "pong ✅")
@@ -3529,6 +3691,7 @@ async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🩺 HEALTH\n"
         f"Mode: {'RT' if REALTIME_MODE else 'INT'} | POLL {REALTIME_POLL_SEC}s\n"
         f"WR: {wr:.1f}% | Watchlist: {len(WATCHLIST)} | Cache: {len(_cache)}\n"
+        f"{td_usage_summary()}\n"
         f"Daily: {stats['trades']}/{stats['max_trades']} trades, "
         f"{stats['losses']}/{stats['max_losses']} losses, Guard {guard}\n"
         f"{scan_line}"
@@ -3720,6 +3883,7 @@ async def health_job(ctx: ContextTypes.DEFAULT_TYPE):
         msg = (
             f"⚙️ Heartbeat | mode {'RT' if REALTIME_MODE else 'INT'} | "
             f"watch {len(WATCHLIST)} | WR {wr:.1f}%\n"
+            f"{td_usage_summary()}\n"
             f"Daily: {stats['trades']}/{stats['max_trades']} trades, "
             f"{stats['losses']}/{stats['max_losses']} losses, Guard {guard}\n"
             f"{scan_line}"
@@ -3782,11 +3946,18 @@ async def _startup_notify(app_):
     if not tgt:
         return
     auto_state = "ON" if (AUTO_ALERTS_ON and AUTO_ALERTS_CHAT_ID and not BRAIN_ONLY) else "OFF"
+    scan_line = "• data check: n/a"
+    if WATCHLIST:
+        try:
+            scan_line = await _build_report_line(WATCHLIST[0], BASE_TF, use_cache=False)
+        except Exception as e:
+            scan_line = f"• data check: err {str(e)[:80]}"
     msg = (
         "🟢 FX Sniper online\n"
         f"Runtime: analyzer.py via bot.py | mode {'RT' if REALTIME_MODE else 'INT'}\n"
         f"Auto alerts: {auto_state} | every {ALERT_INTERVAL_SEC}s | first {ALERTS_FIRST}s\n"
-        f"Watchlist: {', '.join(WATCHLIST)} | TF {BASE_TF} | HTF {HTF_TF}"
+        f"Watchlist: {', '.join(WATCHLIST)} | TF {BASE_TF} | HTF {HTF_TF}\n"
+        f"DATA CHECK\n{td_usage_summary()}\n{scan_line}"
     )
     try:
         await app_.bot.send_message(chat_id=tgt, text=msg)
@@ -3819,6 +3990,7 @@ def main():
     app.add_handler(CommandHandler("daily", cmd_daily))
     app.add_handler(CommandHandler("risk", cmd_risk))
     app.add_handler(CommandHandler("health", cmd_health))
+    app.add_handler(CommandHandler("usage", cmd_usage))
     app.add_handler(CommandHandler("benatky", cmd_benatky))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("trades", cmd_trades))
